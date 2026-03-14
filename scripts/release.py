@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MEGA公開フォルダ → GitHub Release 自動リリーサー
+MEGA公開フォルダ → GitHub Release 自動リリーサー (rclone使用)
 """
 
-import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse, base64
+import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,101 +13,47 @@ APK_PATTERN = r"YouTube-[\d.]+-Morphe\.apk"
 APP_LABEL   = "Morphe YouTube"
 # ────────────────────────────────────────────────────────────
 
-REPO      = os.environ["REPO"]
-GH_TOKEN  = os.environ["GH_TOKEN"]
-MEGA_LINK = "https://mega.nz/folder/A2RE0TwD#JIiV5Sy82y6bH_sMeRNH0Q"
+REPO        = os.environ["REPO"]
+GH_TOKEN    = os.environ["GH_TOKEN"]
+MEGA_REMOTE = "mega revancify:"
 
 STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
 
 
-# ── MEGA 公開フォルダ ────────────────────────────────────────
-def _b64dec(s: str) -> bytes:
-    s = s.replace("-", "+").replace("_", "/")
-    pad = (4 - len(s) % 4) % 4
-    return base64.b64decode(s + "=" * pad)
-
-def _xor(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, (b * (len(a) // len(b) + 1))[:len(a)]))
-
-def _aes_cbc_dec(data: bytes, key: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    c = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16), backend=default_backend())
-    d = c.decryptor()
-    return d.update(data) + d.finalize()
-
-def _mega_api(payload: dict, sid: str | None = None) -> dict:
-    """MEGA APIを呼び出す。sid がある場合はクエリパラメータに付与"""
-    url = "https://g.api.mega.co.nz/cs"
-    if sid:
-        url += f"?sid={sid}"
-    data = json.dumps([payload]).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())
-    r = result[0]
-    if isinstance(r, int) and r < 0:
-        raise RuntimeError(f"MEGA API error code: {r}")
-    return r
-
+# ── MEGA (rclone) ────────────────────────────────────────────
 def list_mega() -> list[tuple[str, int]]:
-    """
-    公開フォルダのファイル一覧を (name, ts) で返す。
-    公開フォルダは2ステップ:
-      1. 'f' コマンドで公開フォルダトークンを取得 → 一時 sid を得る
-      2. その sid でノード一覧を取得
-    """
-    path_part          = MEGA_LINK.split("/folder/")[1]
-    folder_id, key_b64 = path_part.split("#", 1)
-    folder_key         = _b64dec(key_b64)[:16]
-
-    # Step1: 公開フォルダへのアクセストークン取得
-    # n= でフォルダIDを指定し、a=f で公開フォルダ情報を要求
-    info = _mega_api({"a": "f", "c": 1, "r": 1, "ca": 1, "n": folder_id})
-
-    # Step2: ノード一覧はすでに info["f"] に入っている
-    nodes = info.get("f", [])
-    if not nodes:
-        # 別形式: ph= パラメータを使う方式でリトライ
-        info = _mega_api({"a": "f", "c": 1, "r": 1, "ph": folder_id})
-        nodes = info.get("f", [])
-
+    r = subprocess.run(
+        ["rclone", "lsjson", "--verbose", MEGA_REMOTE],
+        capture_output=True, text=True
+    )
+    print(f"  rclone stdout: {r.stdout[:500]}")
+    print(f"  rclone stderr: {r.stderr[:1000]}")  # ← 500→1000に拡大
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"rclone lsjson failed (exit {r.returncode})\n"
+            f"stderr: {r.stderr}"
+        )
     files = []
-    for node in nodes:
-        if node.get("t") != 0:
+    for entry in json.loads(r.stdout):
+        if entry.get("IsDir"):
             continue
-        ts = int(node.get("ts", 0))
+        name = entry["Name"]
         try:
-            raw_key  = _b64dec(node["k"].split(":")[1])
-            node_key = _xor(raw_key, folder_key)
-            aes_key  = (
-                bytes(node_key[i] ^ node_key[i + 16] for i in range(16))
-                if len(node_key) >= 32
-                else node_key[:16]
-            )
-            attr_raw = _aes_cbc_dec(_b64dec(node["a"]), aes_key)
-            attr_str = attr_raw.decode("utf-8", errors="ignore").lstrip("\x00")
-            if attr_str.startswith("MEGA"):
-                name = json.loads(attr_str[4:]).get("n", "")
-                if name:
-                    files.append((name, ts))
-        except Exception as e:
-            print(f"  ⚠️ ノード解析スキップ ({node.get('h','?')}): {e}")
-
+            ts = int(datetime.fromisoformat(entry.get("ModTime", "")).timestamp())
+        except Exception:
+            ts = 0
+        files.append((name, ts))
     return files
 
 def download_mega(filename: str, dest: str) -> str:
-    """megadl で公開フォルダから特定ファイルをダウンロード"""
-    result = subprocess.run(
-        ["megadl", "--path", dest, f"{MEGA_LINK}/{filename}"],
-        capture_output=True, text=True, timeout=300
+    r = subprocess.run(
+        ["rclone", "copy", f"{MEGA_REMOTE}{filename}", dest],
+        capture_output=True, text=True
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"megadl failed:\n{result.stderr}")
+    print(f"  rclone stderr: {r.stderr[:1000]}")
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone copy failed:\n{r.stderr}")
     return os.path.join(dest, filename)
 
 
@@ -188,7 +134,7 @@ def main():
         return
 
     latest_name, latest_ts = matched[0]
-    print(f"📦 対象APK: {latest_name}  (MEGA ts: {latest_ts})")
+    print(f"📦 対象APK: {latest_name}  (更新: {datetime.fromtimestamp(latest_ts, JST).strftime('%Y-%m-%d %H:%M JST')})")
 
     last_ts = state.get("file_ts", 0)
     if latest_ts <= last_ts:

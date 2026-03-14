@@ -19,8 +19,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y megatools aapt
-          pip install cryptography --quiet
+          sudo apt-get install -y aapt
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+          echo "--- rclone config check ---"
+          rclone listremotes
+          echo "--- MEGA connection test ---"
+          rclone lsd "mega revancify:" --verbose || { echo "❌ MEGA接続失敗"; exit 1; }
 
       - name: Run release script
         env:
