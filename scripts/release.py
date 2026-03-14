@@ -23,9 +23,8 @@ JST        = ZoneInfo("Asia/Tokyo")
 
 # ── MEGA 公開フォルダ ────────────────────────────────────────
 def _b64dec(s: str) -> bytes:
-    """MEGAのURL-safe base64をデコード（パディング補完）"""
     s = s.replace("-", "+").replace("_", "/")
-    pad = (4 - len(s) % 4) % 4   # ← 括弧で優先順位を明示
+    pad = (4 - len(s) % 4) % 4
     return base64.b64decode(s + "=" * pad)
 
 def _xor(a: bytes, b: bytes) -> bytes:
@@ -38,44 +37,58 @@ def _aes_cbc_dec(data: bytes, key: bytes) -> bytes:
     d = c.decryptor()
     return d.update(data) + d.finalize()
 
-def list_mega() -> list[tuple[str, int]]:
-    """MEGA APIでファイル一覧を (name, ts) のリストで返す"""
-    path_part             = MEGA_LINK.split("/folder/")[1]
-    folder_id, key_b64    = path_part.split("#", 1)
-    folder_key            = _b64dec(key_b64)[:16]
-
-    # フォルダ内容をAPIで取得
-    payload = json.dumps([{"a": "f", "c": 1, "r": 1, "n": folder_id}]).encode()
+def _mega_api(payload: dict, sid: str | None = None) -> dict:
+    """MEGA APIを呼び出す。sid がある場合はクエリパラメータに付与"""
+    url = "https://g.api.mega.co.nz/cs"
+    if sid:
+        url += f"?sid={sid}"
+    data = json.dumps([payload]).encode()
     req = urllib.request.Request(
-        "https://g.api.mega.co.nz/cs",
-        data=payload, method="POST",
+        url, data=data, method="POST",
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read())
+    r = result[0]
+    if isinstance(r, int) and r < 0:
+        raise RuntimeError(f"MEGA API error code: {r}")
+    return r
 
-    # APIエラー判定（整数が返ってきたらエラーコード）
-    if isinstance(result, int) or isinstance(result[0], int):
-        raise RuntimeError(f"MEGA API error: {result}")
+def list_mega() -> list[tuple[str, int]]:
+    """
+    公開フォルダのファイル一覧を (name, ts) で返す。
+    公開フォルダは2ステップ:
+      1. 'f' コマンドで公開フォルダトークンを取得 → 一時 sid を得る
+      2. その sid でノード一覧を取得
+    """
+    path_part          = MEGA_LINK.split("/folder/")[1]
+    folder_id, key_b64 = path_part.split("#", 1)
+    folder_key         = _b64dec(key_b64)[:16]
 
-    nodes = result[0].get("f", [])
+    # Step1: 公開フォルダへのアクセストークン取得
+    # n= でフォルダIDを指定し、a=f で公開フォルダ情報を要求
+    info = _mega_api({"a": "f", "c": 1, "r": 1, "ca": 1, "n": folder_id})
+
+    # Step2: ノード一覧はすでに info["f"] に入っている
+    nodes = info.get("f", [])
+    if not nodes:
+        # 別形式: ph= パラメータを使う方式でリトライ
+        info = _mega_api({"a": "f", "c": 1, "r": 1, "ph": folder_id})
+        nodes = info.get("f", [])
+
     files = []
-
     for node in nodes:
-        if node.get("t") != 0:       # 0=ファイル, 1=フォルダ
+        if node.get("t") != 0:
             continue
-        ts = int(node.get("ts", 0))  # UNIXタイムスタンプ（復号不要）
+        ts = int(node.get("ts", 0))
         try:
-            # ノードキーを復号してファイル名を取得
             raw_key  = _b64dec(node["k"].split(":")[1])
             node_key = _xor(raw_key, folder_key)
-            # 32バイト以上の場合は前後半をXORして128bit AESキーを生成
-            aes_key = (
+            aes_key  = (
                 bytes(node_key[i] ^ node_key[i + 16] for i in range(16))
                 if len(node_key) >= 32
                 else node_key[:16]
             )
-            # 属性を復号してファイル名を取り出す
             attr_raw = _aes_cbc_dec(_b64dec(node["a"]), aes_key)
             attr_str = attr_raw.decode("utf-8", errors="ignore").lstrip("\x00")
             if attr_str.startswith("MEGA"):
@@ -166,7 +179,6 @@ def main():
     all_files = list_mega()
     print(f"  {len(all_files)} ファイル検出: {[f for f, _ in all_files]}")
 
-    # パターンにマッチするファイルを ts 降順でソート → 最新を選ぶ
     matched = sorted(
         [(f, ts) for f, ts in all_files if pattern.search(f)],
         key=lambda x: x[1], reverse=True,
@@ -178,7 +190,6 @@ def main():
     latest_name, latest_ts = matched[0]
     print(f"📦 対象APK: {latest_name}  (MEGA ts: {latest_ts})")
 
-    # MEGAのタイムスタンプで更新判定
     last_ts = state.get("file_ts", 0)
     if latest_ts <= last_ts:
         last_dt = datetime.fromtimestamp(last_ts, JST).strftime("%Y-%m-%d %H:%M JST")
@@ -194,7 +205,6 @@ def main():
         tag          = now_jst.strftime("v%Y%m%d-%H%M")
         print(f"🏷️  {tag}  ({version_name})")
 
-        # タグ重複時は分を+1してずらす
         while tag in tags:
             now_jst = now_jst.replace(minute=now_jst.minute + 1)
             tag = now_jst.strftime("v%Y%m%d-%H%M")
