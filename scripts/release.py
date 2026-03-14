@@ -23,8 +23,10 @@ JST        = ZoneInfo("Asia/Tokyo")
 
 # ── MEGA 公開フォルダ ────────────────────────────────────────
 def _b64dec(s: str) -> bytes:
+    """MEGAのURL-safe base64をデコード（パディング補完）"""
     s = s.replace("-", "+").replace("_", "/")
-    return base64.b64decode(s + "=" * (4 - len(s) % 4) % 4)
+    pad = (4 - len(s) % 4) % 4   # ← 括弧で優先順位を明示
+    return base64.b64decode(s + "=" * pad)
 
 def _xor(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, (b * (len(a) // len(b) + 1))[:len(a)]))
@@ -38,31 +40,42 @@ def _aes_cbc_dec(data: bytes, key: bytes) -> bytes:
 
 def list_mega() -> list[tuple[str, int]]:
     """MEGA APIでファイル一覧を (name, ts) のリストで返す"""
-    path_part  = MEGA_LINK.split("/folder/")[1]
-    folder_id, folder_key_b64 = path_part.split("#", 1)
-    folder_key = _b64dec(folder_key_b64)[:16]
+    path_part             = MEGA_LINK.split("/folder/")[1]
+    folder_id, key_b64    = path_part.split("#", 1)
+    folder_key            = _b64dec(key_b64)[:16]
 
-    req_data = json.dumps([{"a": "f", "c": 1, "r": 1, "n": folder_id}]).encode()
+    # フォルダ内容をAPIで取得
+    payload = json.dumps([{"a": "f", "c": 1, "r": 1, "n": folder_id}]).encode()
     req = urllib.request.Request(
         "https://g.api.mega.co.nz/cs",
-        data=req_data, method="POST",
+        data=payload, method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req) as resp:
-        nodes = json.loads(resp.read())[0].get("f", [])
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
 
-    files = []  # (name, ts) のリスト
+    # APIエラー判定（整数が返ってきたらエラーコード）
+    if isinstance(result, int) or isinstance(result[0], int):
+        raise RuntimeError(f"MEGA API error: {result}")
+
+    nodes = result[0].get("f", [])
+    files = []
+
     for node in nodes:
-        if node.get("t") != 0:   # 0=ファイル, 1=フォルダ
+        if node.get("t") != 0:       # 0=ファイル, 1=フォルダ
             continue
-        ts = node.get("ts", 0)   # UNIXタイムスタンプ（復号不要）
+        ts = int(node.get("ts", 0))  # UNIXタイムスタンプ（復号不要）
         try:
+            # ノードキーを復号してファイル名を取得
             raw_key  = _b64dec(node["k"].split(":")[1])
             node_key = _xor(raw_key, folder_key)
-            aes_key  = bytes(
-                node_key[i] ^ node_key[i + 16]
-                for i in range(16)
-            ) if len(node_key) >= 32 else node_key[:16]
+            # 32バイト以上の場合は前後半をXORして128bit AESキーを生成
+            aes_key = (
+                bytes(node_key[i] ^ node_key[i + 16] for i in range(16))
+                if len(node_key) >= 32
+                else node_key[:16]
+            )
+            # 属性を復号してファイル名を取り出す
             attr_raw = _aes_cbc_dec(_b64dec(node["a"]), aes_key)
             attr_str = attr_raw.decode("utf-8", errors="ignore").lstrip("\x00")
             if attr_str.startswith("MEGA"):
@@ -71,14 +84,17 @@ def list_mega() -> list[tuple[str, int]]:
                     files.append((name, ts))
         except Exception as e:
             print(f"  ⚠️ ノード解析スキップ ({node.get('h','?')}): {e}")
+
     return files
 
 def download_mega(filename: str, dest: str) -> str:
     """megadl で公開フォルダから特定ファイルをダウンロード"""
-    subprocess.run(
+    result = subprocess.run(
         ["megadl", "--path", dest, f"{MEGA_LINK}/{filename}"],
-        check=True, timeout=300
+        capture_output=True, text=True, timeout=300
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"megadl failed:\n{result.stderr}")
     return os.path.join(dest, filename)
 
 
@@ -88,8 +104,8 @@ def apk_version(path: str) -> str:
         ["aapt", "dump", "badging", path],
         capture_output=True, text=True, check=True
     )
-    vname = re.search(r"versionName='([^']+)'", r.stdout)
-    return vname.group(1) if vname else "0.0.0"
+    m = re.search(r"versionName='([^']+)'", r.stdout)
+    return m.group(1) if m else "0.0.0"
 
 def sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -116,7 +132,8 @@ def existing_tags() -> set[str]:
     try:
         releases = gh("GET", f"/repos/{REPO}/releases?per_page=100")
         return {r["tag_name"] for r in releases}
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ タグ一覧取得失敗（継続）: {e}")
         return set()
 
 def create_release(tag: str, title: str, body: str, apk_path: str):
@@ -145,14 +162,14 @@ def main():
     pattern = re.compile(APK_PATTERN, re.IGNORECASE)
     tags    = existing_tags()
 
-    print(f"📡 MEGAファイル一覧取得中...")
+    print("📡 MEGAファイル一覧取得中...")
     all_files = list_mega()
-    print(f"  {len(all_files)} ファイル検出: {[f for f,_ in all_files]}")
+    print(f"  {len(all_files)} ファイル検出: {[f for f, _ in all_files]}")
 
-    # パターンにマッチするファイルを ts 降順でソートして最新を選ぶ
+    # パターンにマッチするファイルを ts 降順でソート → 最新を選ぶ
     matched = sorted(
         [(f, ts) for f, ts in all_files if pattern.search(f)],
-        key=lambda x: x[1], reverse=True
+        key=lambda x: x[1], reverse=True,
     )
     if not matched:
         print(f"⚠️  マッチするAPKなし (pattern: {APK_PATTERN})")
@@ -165,16 +182,16 @@ def main():
     last_ts = state.get("file_ts", 0)
     if latest_ts <= last_ts:
         last_dt = datetime.fromtimestamp(last_ts, JST).strftime("%Y-%m-%d %H:%M JST")
-        print(f"✅ 更新なし (ts {latest_ts} ≤ {last_ts} / 前回: {last_dt})")
+        print(f"✅ 更新なし (前回: {last_dt})")
         return
 
     with tempfile.TemporaryDirectory() as tmp:
-        print(f"⬇️  ダウンロード中...")
+        print("⬇️  ダウンロード中...")
         apk = download_mega(latest_name, tmp)
 
         version_name = apk_version(apk)
-        now_jst = datetime.now(JST)
-        tag     = now_jst.strftime("v%Y%m%d-%H%M")
+        now_jst      = datetime.now(JST)
+        tag          = now_jst.strftime("v%Y%m%d-%H%M")
         print(f"🏷️  {tag}  ({version_name})")
 
         # タグ重複時は分を+1してずらす
@@ -183,7 +200,7 @@ def main():
             tag = now_jst.strftime("v%Y%m%d-%H%M")
 
         mega_updated = datetime.fromtimestamp(latest_ts, JST).strftime("%Y-%m-%d %H:%M JST")
-        checksum = sha256(apk)
+        checksum     = sha256(apk)
         body = "\n".join([
             f"## {APP_LABEL} {version_name}",
             "",
@@ -207,7 +224,7 @@ def main():
             "released_at":  now_jst.isoformat(),
         }
         STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
-        print(f"🎉 完了!")
+        print("🎉 完了!")
 
 if __name__ == "__main__":
     main()
